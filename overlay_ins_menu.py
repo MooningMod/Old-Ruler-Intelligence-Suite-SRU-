@@ -1,14 +1,25 @@
 import sys
 import ctypes
+import webbrowser
 from pathlib import Path
 mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "SRU_OVERLAY_MUTEX")
 
 from PyQt5.QtCore import Qt, QRect, QTimer
-from PyQt5.QtGui import QPainter, QColor, QFont
+from PyQt5.QtGui import QPainter, QColor, QFont, QPixmap, QImage
 from PyQt5.QtWidgets import QWidget, QApplication
 
 # Import official effect logic from your updated tech_effects.py
 from tech_effects import EFFECT_MAP as CORE_EFFECT_MAP, BOOL_EFFECT_MAP
+
+# Wikipedia info fetcher
+try:
+    from wiki_fetcher import WikiFetcher, UnitInfoPanel
+    WIKI_AVAILABLE = True
+except ImportError:
+    WikiFetcher = None
+    UnitInfoPanel = None
+    WIKI_AVAILABLE = False
+    print("[System] WARNING: wiki_fetcher.py not found. Wikipedia info disabled.")
 
 try:
     import pymem
@@ -158,6 +169,17 @@ class OverlayINS(QWidget):
 
         self.pm = None
         self.base_addr = None
+        
+        # --- Wikipedia Info Panel ---
+        if WIKI_AVAILABLE:
+            self.wiki_fetcher = WikiFetcher(self)
+            self.wiki_fetcher.fetch_complete.connect(self._on_wiki_result)
+            self.wiki_fetcher.fetch_error.connect(self._on_wiki_error)
+            self.unit_info_panel = UnitInfoPanel()
+        else:
+            self.wiki_fetcher = None
+            self.unit_info_panel = None
+        self.info_panel_pixmap = None  # Cache for thumbnail
         self.last_raw_selected_id = None
 
         # INIT WINDOW
@@ -442,6 +464,13 @@ class OverlayINS(QWidget):
         if not self.menu_visible:
             return
         
+        # ESC closes Wikipedia panel first if visible
+        if event.key() == Qt.Key_Escape:
+            if WIKI_AVAILABLE and self.unit_info_panel and self.unit_info_panel.visible:
+                self.unit_info_panel.hide()
+                self.update()
+                return
+        
         # If no search field has focus, check global hotkeys (e.g., Lock)
         no_focus_active = not (self.focus_search or self.tech_search_focus or self.focus_impact_unit_search)
 
@@ -541,6 +570,56 @@ class OverlayINS(QWidget):
             return
 
         pos = event.pos()
+
+        # ==============================================================
+        # 0. WIKIPEDIA INFO PANEL - Handle clicks first if visible
+        # ==============================================================
+        if self.unit_info_panel and self.unit_info_panel.visible:
+            panel = self.unit_info_panel
+            
+            # Close button
+            if panel.close_btn_rect and panel.close_btn_rect.contains(pos):
+                panel.hide()
+                self.update()
+                return
+            
+            # Open browser button
+            if panel.open_browser_btn_rect and panel.open_browser_btn_rect.contains(pos):
+                if panel.found and panel.wiki_url:
+                    webbrowser.open(panel.wiki_url)
+                else:
+                    # Google search fallback
+                    import urllib.parse
+                    query = urllib.parse.quote(panel.unit_name)
+                    webbrowser.open(f"https://www.google.com/search?q={query}+military")
+                return
+            
+            # Click outside panel closes it
+            if panel.rect and not panel.rect.contains(pos):
+                panel.hide()
+                self.update()
+                return
+            
+            # Click inside panel - consume event
+            if panel.rect and panel.rect.contains(pos):
+                return
+
+        # ==============================================================
+        # 0b. CHECK 🔍 SEARCH BUTTONS FOR WIKI
+        # ==============================================================
+        if WIKI_AVAILABLE:
+            if hasattr(self, 'search_btn_b_rect') and self.search_btn_b_rect.contains(pos):
+                if self.selected_unit_b:
+                    self._fetch_unit_info(self.selected_unit_b.name)
+                return
+            if hasattr(self, 'search_btn_c_rect') and self.search_btn_c_rect.contains(pos):
+                if self.selected_unit_c:
+                    self._fetch_unit_info(self.selected_unit_c.name)
+                return
+            if hasattr(self, 'search_btn_d_rect') and self.search_btn_d_rect.contains(pos):
+                if self.selected_unit_d:
+                    self._fetch_unit_info(self.selected_unit_d.name)
+                return
 
         # ==============================================================
         # 1. PRIORITY FIX: CHECK DROPDOWN SELECTION FIRST!
@@ -762,6 +841,10 @@ class OverlayINS(QWidget):
         p.setPen(QColor(55, 55, 65))
         p.drawRect(self.stats_rect)
         draw_comparison_table(self, p, self.stats_rect)
+        
+        # Draw Wikipedia info panel if visible (on top of everything)
+        if WIKI_AVAILABLE and self.unit_info_panel and self.unit_info_panel.visible:
+            self._draw_info_panel(p, full)
 
     def _get_unit_by_id(self, uid: int):
         for u in self.units:
@@ -869,6 +952,160 @@ class OverlayINS(QWidget):
         final_list.sort(key=lambda x: (not x["effects"], not x["unlock"], x["unit"].id))
 
         return final_list
+
+    # -------------------------------------------------------------
+    # WIKIPEDIA INFO PANEL METHODS
+    # -------------------------------------------------------------
+    def _fetch_unit_info(self, unit_name: str):
+        """Start fetching Wikipedia info for a unit."""
+        if not WIKI_AVAILABLE or not self.wiki_fetcher:
+            return
+        
+        self.unit_info_panel.show_loading(unit_name)
+        self.info_panel_pixmap = None
+        self.wiki_fetcher.fetch_unit_info(unit_name)
+        self.update()
+    
+    def _on_wiki_result(self, result: dict):
+        """Handle Wikipedia fetch result."""
+        if not self.unit_info_panel:
+            return
+        
+        self.unit_info_panel.show_result(result)
+        
+        # Convert image data to QPixmap if available
+        if result.get("image_data"):
+            try:
+                image = QImage()
+                image.loadFromData(result["image_data"])
+                self.info_panel_pixmap = QPixmap.fromImage(image)
+            except Exception as e:
+                print(f"[Wiki] Failed to load image: {e}")
+                self.info_panel_pixmap = None
+        else:
+            self.info_panel_pixmap = None
+        
+        self.update()
+    
+    def _on_wiki_error(self, error: str):
+        """Handle Wikipedia fetch error."""
+        if not self.unit_info_panel:
+            return
+        
+        self.unit_info_panel.show_error(error)
+        self.info_panel_pixmap = None
+        self.update()
+    
+    def _draw_info_panel(self, p: QPainter, full_rect: QRect):
+        """Draw the Wikipedia info panel overlay."""
+        if not self.unit_info_panel or not self.unit_info_panel.visible:
+            return
+        
+        panel = self.unit_info_panel
+        
+        # Panel dimensions
+        panel_w, panel_h = 600, 450
+        panel_x = (full_rect.width() - panel_w) // 2
+        panel_y = (full_rect.height() - panel_h) // 2
+        
+        panel.rect = QRect(panel_x, panel_y, panel_w, panel_h)
+        
+        # Semi-transparent backdrop
+        p.fillRect(full_rect, QColor(0, 0, 0, 120))
+        
+        # Panel background
+        p.fillRect(panel.rect, QColor(30, 30, 35, 250))
+        p.setPen(QColor(100, 100, 110))
+        p.drawRect(panel.rect)
+        
+        # Header
+        header_h = 36
+        header_rect = QRect(panel_x, panel_y, panel_w, header_h)
+        p.fillRect(header_rect, QColor(45, 45, 55))
+        
+        # Title
+        p.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        p.setPen(QColor(220, 220, 220))
+        title_rect = QRect(panel_x + 12, panel_y, panel_w - 60, header_h)
+        p.drawText(title_rect, Qt.AlignVCenter | Qt.AlignLeft, panel.title[:50])
+        
+        # Close button
+        close_size = 28
+        panel.close_btn_rect = QRect(panel_x + panel_w - close_size - 6, panel_y + 4, close_size, close_size)
+        p.fillRect(panel.close_btn_rect, QColor(180, 60, 60))
+        p.setPen(QColor(255, 255, 255))
+        p.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        p.drawText(panel.close_btn_rect, Qt.AlignCenter, "✕")
+        
+        # Content area
+        content_y = panel_y + header_h + 10
+        content_x = panel_x + 12
+        
+        # Image area (if available)
+        img_w, img_h = 180, 150
+        if self.info_panel_pixmap and not self.info_panel_pixmap.isNull():
+            img_rect = QRect(content_x, content_y, img_w, img_h)
+            scaled = self.info_panel_pixmap.scaled(img_w, img_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            img_x = content_x + (img_w - scaled.width()) // 2
+            img_y = content_y + (img_h - scaled.height()) // 2
+            p.drawPixmap(img_x, img_y, scaled)
+            p.setPen(QColor(80, 80, 90))
+            p.drawRect(img_rect)
+            text_x = content_x + img_w + 15
+            text_w = panel_w - img_w - 40
+        else:
+            text_x = content_x
+            text_w = panel_w - 24
+        
+        # Status indicator
+        p.setFont(QFont("Segoe UI", 9))
+        if panel.loading:
+            p.setPen(QColor(200, 200, 100))
+            status = "⏳ Loading..."
+        elif panel.found:
+            p.setPen(QColor(100, 200, 100))
+            status = f"✓ Found ({len(panel.summary)} chars)"
+        else:
+            p.setPen(QColor(200, 100, 100))
+            status = "✗ Not found"
+        
+        status_rect = QRect(text_x, content_y, text_w, 20)
+        p.drawText(status_rect, Qt.AlignLeft | Qt.AlignVCenter, status)
+        
+        # Summary text
+        text_y = content_y + 25
+        text_h = panel_h - header_h - 80
+        text_rect = QRect(text_x, text_y, text_w, text_h)
+        
+        p.setFont(QFont("Segoe UI", 9))
+        p.setPen(QColor(200, 200, 200))
+        
+        # Word wrap the summary
+        summary = panel.summary if panel.summary else "No information available."
+        p.drawText(text_rect, Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, summary[:1500])
+        
+        # Bottom button
+        btn_w, btn_h = 150, 32
+        btn_x = panel_x + panel_w - btn_w - 15
+        btn_y = panel_y + panel_h - btn_h - 12
+        panel.open_browser_btn_rect = QRect(btn_x, btn_y, btn_w, btn_h)
+        
+        if panel.found:
+            p.fillRect(panel.open_browser_btn_rect, QColor(60, 120, 180))
+            btn_text = "Full Article →"
+        else:
+            p.fillRect(panel.open_browser_btn_rect, QColor(180, 120, 60))
+            btn_text = "Google Search →"
+        
+        p.setPen(QColor(255, 255, 255))
+        p.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        p.drawText(panel.open_browser_btn_rect, Qt.AlignCenter, btn_text)
+        
+        # Hint
+        p.setFont(QFont("Segoe UI", 8))
+        p.setPen(QColor(150, 150, 150))
+        hint_rect = QRect(panel_x + 12, btn_y + 5, 200, 20)
+        p.drawText(hint_rect, Qt.AlignLeft | Qt.AlignVCenter, "ESC to close")
 
         
 if __name__ == "__main__":
